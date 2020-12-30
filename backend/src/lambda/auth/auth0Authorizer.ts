@@ -1,29 +1,23 @@
-import { CustomAuthorizerEvent, CustomAuthorizerResult } from 'aws-lambda'
+import { APIGatewayTokenAuthorizerEvent, CustomAuthorizerResult } from 'aws-lambda'
 import 'source-map-support/register'
 
-import { verify, decode } from 'jsonwebtoken'
+import { verify } from 'jsonwebtoken'
 import { createLogger } from '../../utils/logger'
-import { Jwt } from '../../auth/Jwt'
+import Axios from 'axios'
 import { JwtPayload } from '../../auth/JwtPayload'
-
-import * as middy from 'middy'
-import { secretsManager } from 'middy/middlewares'
 
 const logger = createLogger('auth')
 
-const secretId = process.env.AUTH_0_SECRET_ID
-const secretField = process.env.AUTH_0_SECRET_FIELD
+const jwksUrl = process.env.AUTH_0_JWKS_URL
 
-export const handler = middy(async (
-  event: CustomAuthorizerEvent,
-  context
+let cachedCertificate: string
+
+export const handler = async (
+  event: APIGatewayTokenAuthorizerEvent
 ): Promise<CustomAuthorizerResult> => {
   logger.info('Authorizing a user', event.authorizationToken)
   try {
-    const jwtToken = verifyToken(
-      event.authorizationToken,
-      context.AUTH0_SECRET[secretField]
-    )
+    const jwtToken = await verifyToken(event.authorizationToken)
     logger.info('User was authorized', jwtToken)
 
     return {
@@ -56,14 +50,16 @@ export const handler = middy(async (
       }
     }
   }
-})
+}
 
-function verifyToken(authHeader: string, secret: string): JwtPayload {
+async function verifyToken(authHeader: string): Promise<JwtPayload> {
   const token = getToken(authHeader)
-  const jwt: Jwt = decode(token, { complete: true }) as Jwt
-  console.log(jwt);
 
-  return verify(token, secret, {algorithms: ['HS256']}) as JwtPayload
+  const cert = await getCertificate()
+
+  logger.info(`Verifying token ${token}`)
+
+  return verify(token, cert, { algorithms: ['RS256'] }) as JwtPayload
 }
 
 function getToken(authHeader: string): string {
@@ -78,13 +74,42 @@ function getToken(authHeader: string): string {
   return token
 }
 
-handler.use(
-  secretsManager({
-    cache: true,
-    cacheExpiryInMillis: 60000,
-    throwOnFailedCall: true,
-    secrets: {
-      AUTH0_SECRET: secretId
-    }
-  })
-)
+async function getCertificate(): Promise<string> {
+  if (cachedCertificate) return cachedCertificate
+
+  logger.info(`Fetching certificate from ${jwksUrl}`)
+
+  const response = await Axios.get(jwksUrl)
+  const keys = response.data.keys
+
+  if (!keys || !keys.length)
+    throw new Error('No JWKS keys found')
+
+  const signingKeys = keys.filter(
+    key => key.use === 'sig'
+           && key.kty === 'RSA'
+           && key.alg === 'RS256'
+           && key.n
+           && key.e
+           && key.kid
+           && (key.x5c && key.x5c.length)
+  )
+
+  if (!signingKeys.length)
+    throw new Error('No JWKS signing keys found')
+
+  const key = signingKeys[0]
+  const pub = key.x5c[0]
+
+  cachedCertificate = certToPEM(pub)
+
+  logger.info('Valid certificate found', cachedCertificate)
+
+  return cachedCertificate
+}
+
+function certToPEM(cert: string): string {
+  cert = cert.match(/.{1,64}/g).join('\n')
+  cert = `-----BEGIN CERTIFICATE-----\n${cert}\n-----END CERTIFICATE-----\n`
+  return cert
+}
